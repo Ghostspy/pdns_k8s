@@ -1,0 +1,219 @@
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: powerdns
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-ha-secret
+  namespace: powerdns
+type: Opaque
+stringData:
+  postgresql-password: "L1ttl3greenm3n"
+  repl-password: "r3pl1cat10nPassw0rd"
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-ha-postgresql
+  namespace: powerdns
+  labels:
+    app.kubernetes.io/name: postgresql-ha
+spec:
+  serviceName: postgres-ha-postgresql-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgresql-ha
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgresql-ha
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+    spec:
+      securityContext:
+        fsGroup: 1001
+      initContainers:
+        - name: detect-role
+          image: bitnamilegacy/os-shell:latest
+          command:
+            - bash
+            - -ec
+            - |
+              ordinal=$(hostname | grep -oE '[0-9]+$' || echo 0)
+              mkdir -p /role
+              if [[ "$ordinal" == "0" ]]; then
+                echo "primary" > /role/role.txt
+              else
+                echo "standby" > /role/role.txt
+              fi
+              echo "Detected role: $(cat /role/role.txt)"
+          volumeMounts:
+            - name: role-data
+              mountPath: /role
+
+      containers:
+        - name: postgresql
+          image: bitnamilegacy/postgresql-repmgr:15.7.0-debian-12-r2
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgresql
+              containerPort: 5432
+          command:
+            - bash
+            - -ec
+            - |
+              ROLE=$(cat /role/role.txt)
+              echo "🧩 Detected role file → $ROLE"
+
+              if [[ "$ROLE" == "primary" ]]; then
+                echo "🟢 Pod-0: initializing new primary if cluster empty..."
+                if [ ! -s /bitnami/postgresql/data/PG_VERSION ]; then
+                  echo "Initializing new database..."
+                  /opt/bitnami/scripts/postgresql-repmgr/setup.sh
+                  /opt/bitnami/scripts/postgresql-repmgr/postunpack.sh
+                  /opt/bitnami/scripts/postgresql-repmgr/entrypoint.sh /opt/bitnami/scripts/postgresql-repmgr/run.sh &
+                  sleep 10
+                  psql -U postgres -c "CREATE DATABASE repmgr;"
+                  psql -U postgres -c "CREATE USER repmgr WITH SUPERUSER ENCRYPTED PASSWORD '${REPMGR_PASSWORD}';"
+                  psql -U postgres -c "GRANT ALL PRIVILEGES ON DATABASE repmgr TO repmgr;"
+                fi
+                exec /opt/bitnami/scripts/postgresql-repmgr/entrypoint.sh /opt/bitnami/scripts/postgresql-repmgr/run.sh
+              else
+                echo "🟡 Standby → following primary..."
+                export REPMGR_PRIMARY_HOST=postgres-ha-postgresql-0.postgres-ha-postgresql-headless.powerdns.svc.wyse.local
+                exec /opt/bitnami/scripts/postgresql-repmgr/entrypoint.sh /opt/bitnami/scripts/postgresql-repmgr/run.sh
+              fi
+          env:
+            - name: POSTGRESQL_POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-ha-secret
+                  key: postgresql-password
+            - name: POSTGRESQL_USERNAME
+              value: postgres
+            - name: POSTGRESQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-ha-secret
+                  key: postgresql-password
+            - name: POSTGRESQL_DATABASE
+              value: pdns
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-ha-secret
+                  key: repl-password
+            - name: REPMGR_PRIMARY_PORT
+              value: "5432"
+            - name: REPMGR_PARTNER_NODES
+              value: postgres-ha-postgresql-0.postgres-ha-postgresql-headless,postgres-ha-postgresql-1.postgres-ha-postgresql-headless,postgres-ha-postgresql-2.postgres-ha-postgresql-headless
+            - name: REPMGR_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: REPMGR_NODE_NETWORK_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+            - name: role-data
+              mountPath: /role
+
+        # 🩺 repmgrd background auto-failover daemon
+        - name: repmgrd
+          image: bitnamilegacy/postgresql-repmgr:15.7.0-debian-12-r2
+          command:
+            - bash
+            - -ec
+            - |
+              sleep 30
+              echo "⚙️ Starting repmgrd auto-failover daemon..."
+              exec repmgrd -f /opt/bitnami/repmgr/conf/repmgr.conf --daemonize=false
+          env:
+            - name: REPMGR_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-ha-secret
+                  key: repl-password
+          volumeMounts:
+            - name: data
+              mountPath: /bitnami/postgresql
+
+        - name: postgres-exporter
+          image: quay.io/prometheuscommunity/postgres-exporter:latest
+          ports:
+            - name: metrics
+              containerPort: 9187
+          env:
+            - name: DATA_SOURCE_URI
+              value: "localhost:5432/pdns?sslmode=disable"
+            - name: DATA_SOURCE_USER
+              value: postgres
+            - name: DATA_SOURCE_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-ha-secret
+                  key: postgresql-password
+
+      volumes:
+        - name: role-data
+          emptyDir: {}
+
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: rook-ceph-block
+        resources:
+          requests:
+            storage: 100Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-ha-postgresql-headless
+  namespace: powerdns
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgresql-ha
+  ports:
+    - name: postgresql
+      port: 5432
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary
+  namespace: powerdns
+spec:
+  selector:
+    app.kubernetes.io/name: postgresql-ha
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replicas
+  namespace: powerdns
+spec:
+  selector:
+    app.kubernetes.io/name: postgresql-ha
+  ports:
+    - name: postgresql
+      port: 5432
+      targetPort: postgresql

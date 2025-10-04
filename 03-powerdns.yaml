@@ -1,0 +1,337 @@
+---
+# Service for PowerDNS API
+apiVersion: v1
+kind: Service
+metadata:
+  name: powerdns-api
+  namespace: powerdns
+  labels:
+    app: powerdns
+spec:
+  type: ClusterIP
+  selector:
+    app: powerdns
+  ports:
+  - name: api
+    port: 8081
+    targetPort: 8081
+    protocol: TCP
+
+---
+# Service for PowerDNS metrics
+apiVersion: v1
+kind: Service
+metadata:
+  name: powerdns-metrics
+  namespace: powerdns
+  labels:
+    app: powerdns
+spec:
+  type: ClusterIP
+  selector:
+    app: powerdns
+  ports:
+  - name: metrics
+    port: 9120
+    targetPort: 9120
+    protocol: TCP
+
+---
+# Service for PowerDNS Web Interface
+apiVersion: v1
+kind: Service
+metadata:
+  name: powerdns-webserver
+  namespace: powerdns
+spec:
+  type: NodePort
+  selector:
+    app: powerdns
+  ports:
+  - name: webserver
+    port: 8081
+    targetPort: 8081
+    protocol: TCP
+    nodePort: 30081
+
+---
+# HorizontalPodAutoscaler for PowerDNS
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: powerdns-hpa
+  namespace: powerdns
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: powerdns
+  minReplicas: 5
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30
+      - type: Pods
+        value: 2
+        periodSeconds: 30
+      selectPolicy: Max
+
+---
+# PodDisruptionBudget for PowerDNS
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: powerdns-pdb
+  namespace: powerdns
+spec:
+  minAvailable: 3
+  selector:
+    matchLabels:
+      app: powerdns
+# Secret for PowerDNS API
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pdns-api-secret
+  namespace: powerdns
+type: Opaque
+stringData:
+  api-key: "z3r0trU5t@p1k3y"
+
+---
+# PowerDNS Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: powerdns
+  namespace: powerdns
+  labels:
+    app: powerdns
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: powerdns
+  template:
+    metadata:
+      labels:
+        app: powerdns
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9120"
+        prometheus.io/path: "/metrics"
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                - key: app
+                  operator: In
+                  values:
+                  - powerdns
+              topologyKey: kubernetes.io/hostname
+      initContainers:
+      - name: wait-for-postgres
+        image: postgres:15
+        command:
+        - sh
+        - -c
+        - |
+          echo "Waiting for PostgreSQL primary to be ready..."
+          until pg_isready -h postgres-primary -p 5432 -U postgres; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+          echo "PostgreSQL is ready!"
+          
+          echo "Verifying PowerDNS database exists..."
+          until PGPASSWORD=$PDNS_PASSWORD psql -h postgres-primary -U $PDNS_USER -d $PDNS_DATABASE -c "SELECT 1 FROM domains LIMIT 1;" 2>/dev/null; do
+            echo "Waiting for PowerDNS schema to be initialized..."
+            sleep 2
+          done
+          echo "PowerDNS database is ready!"
+        env:
+        - name: PDNS_USER
+          valueFrom:
+            secretKeyRef:
+              name: pdns-db-secret
+              key: pdns-user
+        - name: PDNS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: pdns-db-secret
+              key: pdns-password
+        - name: PDNS_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: pdns-db-secret
+              key: pdns-database
+      containers:
+      - name: powerdns
+        image: pschiffe/pdns-pgsql:latest
+        ports:
+        - containerPort: 53
+          name: dns-udp
+          protocol: UDP
+        - containerPort: 53
+          name: dns-tcp
+          protocol: TCP
+        - containerPort: 8081
+          name: api
+          protocol: TCP
+        env:
+        - name: PDNS_launch
+          value: "gpgsql"
+        - name: PDNS_gpgsql_host
+          value: "postgres-primary"
+        - name: PDNS_gpgsql_port
+          value: "5432"
+        - name: PDNS_gpgsql_user
+          valueFrom:
+            secretKeyRef:
+              name: pdns-db-secret
+              key: pdns-user
+        - name: PDNS_gpgsql_password
+          valueFrom:
+            secretKeyRef:
+              name: pdns-db-secret
+              key: pdns-password
+        - name: PDNS_gpgsql_dbname
+          valueFrom:
+            secretKeyRef:
+              name: pdns-db-secret
+              key: pdns-database
+        - name: PDNS_api
+          value: "yes"
+        - name: PDNS_api_key
+          valueFrom:
+            secretKeyRef:
+              name: pdns-api-secret
+              key: api-key
+        - name: PDNS_webserver
+          value: "yes"
+        - name: PDNS_webserver_address
+          value: "0.0.0.0"
+        - name: PDNS_webserver_port
+          value: "8081"
+        - name: PDNS_webserver_allow_from
+          value: "0.0.0.0/0"
+        - name: PDNS_local_address
+          value: "0.0.0.0"
+        - name: PDNS_local_port
+          value: "53"
+        - name: PDNS_version_string
+          value: "anonymous"
+        - name: PDNS_guardian
+          value: "yes"
+        - name: PDNS_daemon
+          value: "no"
+        - name: PDNS_disable_syslog
+          value: "yes"
+        - name: PDNS_log_dns_details
+          value: "yes"
+        - name: PDNS_log_dns_queries
+          value: "no"
+        - name: PDNS_loglevel
+          value: "4"
+        - name: PDNS_query_cache_ttl
+          value: "60"
+        - name: PDNS_cache_ttl
+          value: "60"
+        - name: PDNS_negquery_cache_ttl
+          value: "60"
+        livenessProbe:
+          tcpSocket:
+            port: 53
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          tcpSocket:
+            port: 53
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1000m"
+      
+      - name: pdns-exporter
+        image: pschiffe/pdns-exporter:latest
+        ports:
+        - containerPort: 9120
+          name: metrics
+        env:
+        - name: PDNS_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: pdns-api-secret
+              key: api-key
+        - name: PDNS_HOST
+          value: "http://localhost:8081"
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+
+---
+# Service for PowerDNS DNS (LoadBalancer)
+apiVersion: v1
+kind: Service
+metadata:
+  name: powerdns-dns
+  namespace: powerdns
+  annotations:
+    metallb.universe.tf/allow-shared-ip: "powerdns"
+spec:
+  type: LoadBalancer
+  selector:
+    app: powerdns
+  ports:
+  - name: dns-udp
+    port: 53
+    targetPort: 53
+    protocol: UDP
+  - name: dns-tcp
+    port: 53
+    targetPort: 53
+    protocol: TCP
+  sessionAffinity: None
+  externalTrafficPolicy: Local
+
+---

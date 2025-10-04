@@ -1,0 +1,458 @@
+---
+# Namespace for PowerDNS
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: powerdns
+  labels:
+    name: powerdns
+
+---
+# ConfigMap for PostgreSQL configuration
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-config
+  namespace: powerdns
+data:
+  postgresql.conf: |
+    listen_addresses = '*'
+    max_connections = 200
+    shared_buffers = 2GB
+    effective_cache_size = 6GB
+    maintenance_work_mem = 512MB
+    checkpoint_completion_target = 0.9
+    wal_buffers = 16MB
+    default_statistics_target = 100
+    random_page_cost = 1.1
+    effective_io_concurrency = 200
+    work_mem = 10485kB
+    min_wal_size = 1GB
+    max_wal_size = 4GB
+    max_worker_processes = 4
+    max_parallel_workers_per_gather = 2
+    max_parallel_workers = 4
+    max_parallel_maintenance_workers = 2
+    
+    # Replication settings
+    wal_level = replica
+    max_wal_senders = 10
+    max_replication_slots = 10
+    hot_standby = on
+    hot_standby_feedback = on
+    
+    # Logging
+    logging_collector = on
+    log_directory = 'log'
+    log_filename = 'postgresql-%Y-%m-%d_%H%M%S.log'
+    log_rotation_age = 1d
+    log_rotation_size = 100MB
+    log_line_prefix = '%t [%p]: [%l-1] user=%u,db=%d,app=%a,client=%h '
+    log_timezone = 'UTC'
+    
+    # Statistics for monitoring
+    shared_preload_libraries = 'pg_stat_statements'
+    pg_stat_statements.track = all
+    track_io_timing = on
+    track_functions = all
+  
+  pg_hba.conf: |
+    # TYPE  DATABASE        USER            ADDRESS                 METHOD
+    local   all             all                                     trust
+    host    all             all             127.0.0.1/32            trust
+    host    all             all             ::1/128                 trust
+    host    all             all             0.0.0.0/0               md5
+    host    replication     replicator      0.0.0.0/0               md5
+
+---
+# Secret for PostgreSQL credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-secret
+  namespace: powerdns
+type: Opaque
+stringData:
+  postgres-password: "L1ttl3greenm3n"
+  replication-password: "r3pl1cat10nPassw0rd"
+
+---
+# StatefulSet for PostgreSQL with streaming replication
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: powerdns
+  labels:
+    app: postgres
+spec:
+  serviceName: postgres
+  replicas: 1  # Start with 1, scale to 3 after primary is initialized
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9187"
+    spec:
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsGroup: 999
+      affinity:
+        podAntiAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+          - labelSelector:
+              matchExpressions:
+              - key: app
+                operator: In
+                values:
+                - postgres
+            topologyKey: kubernetes.io/hostname
+      initContainers:
+      - name: init-postgres
+        image: postgres:15
+        command:
+        - bash
+        - -c
+        - |
+          set -ex
+          
+          # Get pod ordinal from hostname
+          [[ `hostname` =~ -([0-9]+)$ ]] || exit 1
+          ordinal=${BASH_REMATCH[1]}
+          
+          echo "Pod ordinal: $ordinal"
+          echo "PGDATA will be: /var/lib/postgresql/data/pgdata"
+          
+          # Check if PostgreSQL is already initialized
+          if [ -f /var/lib/postgresql/data/pgdata/PG_VERSION ]; then
+            echo "PostgreSQL already initialized (PG_VERSION found), skipping init"
+            exit 0
+          fi
+          
+          if [[ $ordinal -eq 0 ]]; then
+            echo "Primary node (postgres-0) - initialization will be handled by main container"
+            # Just ensure pgdata directory exists
+            mkdir -p /var/lib/postgresql/data/pgdata
+          else
+            echo "Replica node (postgres-$ordinal) - will replicate from primary"
+            
+            # Wait for primary to be fully ready
+            echo "Waiting for primary postgres-0 to be ready..."
+            max_attempts=60
+            attempt=0
+            
+            until pg_isready -h postgres-0.postgres.powerdns.svc.cluster.local -U postgres -d postgres 2>/dev/null; do
+              attempt=$((attempt+1))
+              if [ $attempt -ge $max_attempts ]; then
+                echo "ERROR: Primary not ready after $max_attempts attempts"
+                exit 1
+              fi
+              echo "Attempt $attempt/$max_attempts: Primary not ready yet, waiting..."
+              sleep 5
+            done
+            
+            echo "Primary is ready! Waiting additional 10 seconds for full initialization..."
+            sleep 10
+            
+            # Verify replicator user exists
+            echo "Verifying replicator user exists on primary..."
+            attempt=0
+            until PGPASSWORD=$POSTGRES_PASSWORD psql -h postgres-0.postgres.powerdns.svc.cluster.local -U postgres -d postgres -c "SELECT 1 FROM pg_roles WHERE rolname='replicator';" 2>/dev/null | grep -q 1; do
+              attempt=$((attempt+1))
+              if [ $attempt -ge 30 ]; then
+                echo "ERROR: Replicator user not found after $attempt attempts"
+                exit 1
+              fi
+              echo "Attempt $attempt/30: Waiting for replicator user to be created..."
+              sleep 5
+            done
+            
+            echo "Replicator user verified! Creating base backup from primary..."
+            
+            # Ensure pgdata directory is empty
+            rm -rf /var/lib/postgresql/data/pgdata
+            mkdir -p /var/lib/postgresql/data/pgdata
+            
+            # Create base backup with retry logic
+            max_backup_attempts=3
+            backup_attempt=0
+            backup_success=false
+            
+            while [ $backup_attempt -lt $max_backup_attempts ]; do
+              backup_attempt=$((backup_attempt+1))
+              echo "Backup attempt $backup_attempt/$max_backup_attempts..."
+              
+              if PGPASSWORD=$REPLICATION_PASSWORD pg_basebackup \
+                -h postgres-0.postgres.powerdns.svc.cluster.local \
+                -D /var/lib/postgresql/data/pgdata \
+                -U replicator \
+                -v -P -R -X stream -c fast; then
+                backup_success=true
+                break
+              else
+                echo "Backup attempt $backup_attempt failed"
+                rm -rf /var/lib/postgresql/data/pgdata
+                mkdir -p /var/lib/postgresql/data/pgdata
+                if [ $backup_attempt -lt $max_backup_attempts ]; then
+                  echo "Retrying in 10 seconds..."
+                  sleep 10
+                fi
+              fi
+            done
+            
+            if [ "$backup_success" = false ]; then
+              echo "ERROR: Failed to create backup after $max_backup_attempts attempts"
+              exit 1
+            fi
+            
+            echo "Base backup completed successfully!"
+          fi
+        env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: postgres-password
+        - name: REPLICATION_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: replication-password
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+      containers:
+      - name: postgres
+        image: postgres:15
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: postgres-password
+        - name: REPLICATION_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: replication-password
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        - name: POSTGRES_INITDB_ARGS
+          value: "--encoding=UTF8 --locale=en_US.UTF-8"
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+        - name: postgres-config
+          mountPath: /etc/postgresql
+        command:
+        - bash
+        - -c
+        - |
+          set -e
+          
+          # Get pod ordinal
+          ordinal=0
+          if [[ $(hostname) =~ -([0-9]+)$ ]]; then
+            ordinal=${BASH_REMATCH[1]}
+          fi
+          
+          echo "Starting PostgreSQL (ordinal: $ordinal)"
+          echo "PGDATA: $PGDATA"
+          
+          # Create PGDATA directory if it doesn't exist
+          mkdir -p $PGDATA
+          
+          if [[ $ordinal -eq 0 ]]; then
+            echo "Starting as PRIMARY server"
+            
+            # Check if this is first-time initialization
+            if [ ! -f $PGDATA/PG_VERSION ]; then
+              echo "First-time initialization - PGDATA is empty"
+              echo "Running initdb manually for better control..."
+              
+              # Run initdb manually
+              initdb -D $PGDATA --encoding=UTF8 --locale=en_US.UTF-8
+              
+              # Copy our custom configs
+              cp /etc/postgresql/postgresql.conf $PGDATA/
+              cp /etc/postgresql/pg_hba.conf $PGDATA/
+              
+              # Start postgres temporarily to create users
+              echo "Starting temporary PostgreSQL to create users..."
+              pg_ctl -D $PGDATA -o "-c listen_addresses=''" -w start
+              
+              # Create replication user
+              echo "Creating replication user..."
+              psql -v ON_ERROR_STOP=1 --username postgres --dbname postgres -c "CREATE USER replicator WITH REPLICATION ENCRYPTED PASSWORD '$REPLICATION_PASSWORD';"
+              
+              echo "Replication user created successfully"
+              
+              # Stop temporary instance
+              echo "Stopping temporary instance..."
+              pg_ctl -D $PGDATA -w stop
+              
+              echo "Initialization complete, starting PostgreSQL normally..."
+            else
+              echo "PGDATA exists with initialized database"
+              # Ensure configs are up to date
+              cp /etc/postgresql/postgresql.conf $PGDATA/
+              cp /etc/postgresql/pg_hba.conf $PGDATA/
+            fi
+            
+            # Start PostgreSQL normally
+            exec postgres
+          else
+            echo "Starting as REPLICA server"
+            
+            # Replicas should have data from pg_basebackup
+            if [ ! -f $PGDATA/PG_VERSION ]; then
+              echo "ERROR: Replica has no data! Init container should have run pg_basebackup"
+              exit 1
+            fi
+            
+            # Ensure standby.signal exists for replica
+            echo "Creating standby.signal for replica mode..."
+            touch $PGDATA/standby.signal
+            
+            # Update configs
+            cp /etc/postgresql/postgresql.conf $PGDATA/
+            cp /etc/postgresql/pg_hba.conf $PGDATA/
+            
+            exec postgres
+          fi
+        livenessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - exec pg_isready -U postgres -h 127.0.0.1 -p 5432
+          initialDelaySeconds: 60
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - /bin/sh
+            - -c
+            - exec pg_isready -U postgres -h 127.0.0.1 -p 5432
+          initialDelaySeconds: 30
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1000m"
+          limits:
+            memory: "4Gi"
+            cpu: "2000m"
+      
+      - name: postgres-exporter
+        image: quay.io/prometheuscommunity/postgres-exporter:latest
+        ports:
+        - containerPort: 9187
+          name: metrics
+        env:
+        - name: DATA_SOURCE_NAME
+          value: "postgresql://postgres:$(POSTGRES_PASSWORD)@localhost:5432/postgres?sslmode=disable"
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-secret
+              key: postgres-password
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+      
+      volumes:
+      - name: postgres-config
+        configMap:
+          name: postgres-config
+  volumeClaimTemplates:
+  - metadata:
+      name: postgres-data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      storageClassName: rook-ceph-block
+      resources:
+        requests:
+          storage: 100Gi
+
+---
+# Headless Service for PostgreSQL StatefulSet
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: powerdns
+  labels:
+    app: postgres
+spec:
+  ports:
+  - port: 5432
+    name: postgres
+  - port: 9187
+    name: metrics
+  clusterIP: None
+  selector:
+    app: postgres
+
+---
+# Service for PostgreSQL Primary (read-write)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-primary
+  namespace: powerdns
+  labels:
+    app: postgres
+spec:
+  ports:
+  - port: 5432
+    name: postgres
+  selector:
+    app: postgres
+    statefulset.kubernetes.io/pod-name: postgres-0
+
+---
+# Service for PostgreSQL Replicas (read-only)
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-replicas
+  namespace: powerdns
+  labels:
+    app: postgres
+spec:
+  ports:
+  - port: 5432
+    name: postgres
+  selector:
+    app: postgres
+
+---
+# PodDisruptionBudget for PostgreSQL
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: postgres-pdb
+  namespace: powerdns
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app: postgres

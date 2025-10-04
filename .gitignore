@@ -1,0 +1,55 @@
+# Logs
+*.log
+*.out
+*.err
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python / Node / Go vendor stuff (if used in your k8s tooling)
+__pycache__/
+node_modules/
+vendor/
+
+# Helm specific
+charts/
+*.tgz
+Chart.lock
+
+# Kustomize build output
+kustomize-build/
+*.yaml.tmp
+
+# Kubernetes secrets / configmaps (generated or sensitive)
+secret*.yaml
+secrets/
+config*.yaml
+.env
+*.crt
+*.key
+
+# Terraform (if infra included)
+.terraform/
+*.tfstate
+*.tfstate.backup
+crash.log
+
+# Temporary manifests (don’t check in kubectl outputs)
+kubectl-*.yaml
+*.bak
+*.tmp
+
+# Package archives
+*.tar.gz
+*.zip
+
+# Generated manifests or overrides
+overrides.yaml
+values.override.yaml
